@@ -88,6 +88,7 @@ Memory Format:
 source -- relationship -- destination
 
 Provide a list of deletion instructions, each specifying the relationship to be deleted.
+You MUST respond in JSON format.
 `;
 
 export function getDeleteMessages(
