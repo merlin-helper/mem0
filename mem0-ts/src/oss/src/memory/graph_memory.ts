@@ -12,6 +12,7 @@ import {
 } from "../graphs/tools";
 import { EXTRACT_RELATIONS_PROMPT, getDeleteMessages } from "../graphs/utils";
 import { logger } from "../utils/logger";
+import { parseJsonResponse } from "../utils/json_parser";
 
 interface SearchOutput {
   source: string;
@@ -225,7 +226,8 @@ export class MemoryGraph {
       if (typeof searchResults !== "string" && searchResults.toolCalls) {
         for (const call of searchResults.toolCalls) {
           if (call.name === "extract_entities") {
-            const args = JSON.parse(call.arguments);
+            const args = parseJsonResponse(call.arguments);
+            if (!args || !Array.isArray(args.entities)) continue;
             for (const item of args.entities) {
               if (item && item.entity != null && item.entity_type != null) {
                 entityTypeMap[item.entity] = item.entity_type;
@@ -302,8 +304,8 @@ export class MemoryGraph {
     if (typeof extractedEntities !== "string" && extractedEntities.toolCalls) {
       const toolCall = extractedEntities.toolCalls[0];
       if (toolCall && toolCall.arguments) {
-        const args = JSON.parse(toolCall.arguments);
-        entities = args.entities || [];
+        const args = parseJsonResponse(toolCall.arguments);
+        entities = args?.entities || [];
       }
     }
 
@@ -406,7 +408,8 @@ export class MemoryGraph {
     if (typeof memoryUpdates !== "string" && memoryUpdates.toolCalls) {
       for (const item of memoryUpdates.toolCalls) {
         if (item.name === "delete_graph_memory") {
-          toBeDeleted.push(JSON.parse(item.arguments));
+          const parsed = parseJsonResponse(item.arguments);
+          if (parsed) toBeDeleted.push(parsed);
         }
       }
     }
