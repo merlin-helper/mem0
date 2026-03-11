@@ -1,7 +1,29 @@
 import { VectorStore } from "./base";
 import { SearchFilters, VectorStoreConfig, VectorStoreResult } from "../types";
-import sqlite3 from "sqlite3";
+import type sqlite3Type from "sqlite3";
 import path from "path";
+import os from "os";
+
+/**
+ * Lazy-load sqlite3 only when actually needed. Works in both CJS and ESM.
+ * This avoids loading the native node_sqlite3 addon at module-import time,
+ * which would crash under macOS launchd where process.cwd() is "/" and the
+ * default vector_store.db path is unwritable.
+ */
+function loadSqlite3(): typeof sqlite3Type {
+  // CJS context: require is available directly
+  if (typeof require === "function") {
+    try { return require("sqlite3"); } catch {}
+  }
+  // ESM context or bundler-wrapped: try createRequire with __filename
+  try {
+    const { createRequire } = require("module");
+    return createRequire(__filename)("sqlite3");
+  } catch {}
+  // Last resort: dynamic import would be async so we can't use it in a constructor.
+  // If we get here, sqlite3 simply isn't available.
+  throw new Error("Failed to load sqlite3: neither require() nor createRequire() available");
+}
 
 interface MemoryVector {
   id: string;
@@ -10,16 +32,20 @@ interface MemoryVector {
 }
 
 export class MemoryVectorStore implements VectorStore {
-  private db: sqlite3.Database;
+  private db: sqlite3Type.Database;
   private dimension: number;
   private dbPath: string;
 
   constructor(config: VectorStoreConfig) {
     this.dimension = config.dimension || 1536; // Default OpenAI dimension
-    this.dbPath = path.join(process.cwd(), "vector_store.db");
+    // Use os.tmpdir() instead of process.cwd() to avoid SQLITE_CANTOPEN when
+    // cwd is unwritable (e.g. "/" under macOS launchd). Lazy-import sqlite3 so
+    // the native addon is only loaded when this class is actually instantiated.
+    this.dbPath = path.join(os.tmpdir(), "mem0-vector_store.db");
     if (config.dbPath) {
       this.dbPath = config.dbPath;
     }
+    const sqlite3 = loadSqlite3();
     this.db = new sqlite3.Database(this.dbPath);
     this.init().catch(console.error);
   }

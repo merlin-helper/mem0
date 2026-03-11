@@ -12,6 +12,7 @@ import {
 } from "../graphs/tools";
 import { EXTRACT_RELATIONS_PROMPT, getDeleteMessages } from "../graphs/utils";
 import { logger } from "../utils/logger";
+import { parseJsonResponse } from "../utils/json_parser";
 
 interface SearchOutput {
   source: string;
@@ -212,7 +213,7 @@ export class MemoryGraph {
       [
         {
           role: "system",
-          content: `You are a smart assistant who understands entities and their types in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use ${filters["userId"]} as the source entity. Extract all the entities from the text. ***DO NOT*** answer the question itself if the given text is a question.`,
+          content: `You are a smart assistant who understands entities and their types in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use ${filters["userId"]} as the source entity. Extract all the entities from the text. ***DO NOT*** answer the question itself if the given text is a question. Return the result as JSON.`,
         },
         { role: "user", content: data },
       ],
@@ -225,9 +226,12 @@ export class MemoryGraph {
       if (typeof searchResults !== "string" && searchResults.toolCalls) {
         for (const call of searchResults.toolCalls) {
           if (call.name === "extract_entities") {
-            const args = JSON.parse(call.arguments);
+            const args = parseJsonResponse(call.arguments);
+            if (!args || !Array.isArray(args.entities)) continue;
             for (const item of args.entities) {
-              entityTypeMap[item.entity] = item.entity_type;
+              if (item && item.entity != null && item.entity_type != null) {
+                entityTypeMap[item.entity] = item.entity_type;
+              }
             }
           }
         }
@@ -237,10 +241,16 @@ export class MemoryGraph {
     }
 
     entityTypeMap = Object.fromEntries(
-      Object.entries(entityTypeMap).map(([k, v]) => [
-        k.toLowerCase().replace(/ /g, "_"),
-        v.toLowerCase().replace(/ /g, "_"),
-      ]),
+      Object.entries(entityTypeMap)
+        .filter(([k, v]) => k != null && v != null)
+        .map(([k, v]) => [
+          String(k)
+            .toLowerCase()
+            .replace(/[^a-zA-Z0-9_]/g, "_"),
+          String(v)
+            .toLowerCase()
+            .replace(/[^a-zA-Z0-9_]/g, "_"),
+        ]),
     );
 
     logger.debug(`Entity type map: ${JSON.stringify(entityTypeMap)}`);
@@ -294,8 +304,8 @@ export class MemoryGraph {
     if (typeof extractedEntities !== "string" && extractedEntities.toolCalls) {
       const toolCall = extractedEntities.toolCalls[0];
       if (toolCall && toolCall.arguments) {
-        const args = JSON.parse(toolCall.arguments);
-        entities = args.entities || [];
+        const args = parseJsonResponse(toolCall.arguments);
+        entities = args?.entities || [];
       }
     }
 
@@ -398,7 +408,8 @@ export class MemoryGraph {
     if (typeof memoryUpdates !== "string" && memoryUpdates.toolCalls) {
       for (const item of memoryUpdates.toolCalls) {
         if (item.name === "delete_graph_memory") {
-          toBeDeleted.push(JSON.parse(item.arguments));
+          const parsed = parseJsonResponse(item.arguments);
+          if (parsed) toBeDeleted.push(parsed);
         }
       }
     }
@@ -416,26 +427,30 @@ export class MemoryGraph {
 
     try {
       for (const item of toBeDeleted) {
-        const { source, destination, relationship } = item;
+        try {
+          const { source, destination, relationship } = item;
 
-        const cypher = `
-          MATCH (n {name: $source_name, user_id: $user_id})
-          -[r:${relationship}]->
-          (m {name: $dest_name, user_id: $user_id})
-          DELETE r
-          RETURN 
-              n.name AS source,
-              m.name AS target,
-              type(r) AS relationship
-        `;
+          const cypher = `
+            MATCH (n {name: $source_name, user_id: $user_id})
+            -[r:${relationship}]->
+            (m {name: $dest_name, user_id: $user_id})
+            DELETE r
+            RETURN
+                n.name AS source,
+                m.name AS target,
+                type(r) AS relationship
+          `;
 
-        const result = await session.run(cypher, {
-          source_name: source,
-          dest_name: destination,
-          user_id: userId,
-        });
+          const result = await session.run(cypher, {
+            source_name: source,
+            dest_name: destination,
+            user_id: userId,
+          });
 
-        results.push(result.records);
+          results.push(result.records);
+        } catch (e) {
+          logger.error(`Error deleting entity: ${e}`);
+        }
       }
     } finally {
       await session.close();
@@ -454,30 +469,31 @@ export class MemoryGraph {
 
     try {
       for (const item of toBeAdded) {
-        const { source, destination, relationship } = item;
-        const sourceType = entityTypeMap[source] || "unknown";
-        const destinationType = entityTypeMap[destination] || "unknown";
+        try {
+          const { source, destination, relationship } = item;
+          const sourceType = entityTypeMap[source] || "unknown";
+          const destinationType = entityTypeMap[destination] || "unknown";
 
-        const sourceEmbedding = await this.embeddingModel.embed(source);
-        const destEmbedding = await this.embeddingModel.embed(destination);
+          const sourceEmbedding = await this.embeddingModel.embed(source);
+          const destEmbedding = await this.embeddingModel.embed(destination);
 
-        const sourceNodeSearchResult = await this._searchSourceNode(
-          sourceEmbedding,
-          userId,
-        );
-        const destinationNodeSearchResult = await this._searchDestinationNode(
-          destEmbedding,
-          userId,
-        );
+          const sourceNodeSearchResult = await this._searchSourceNode(
+            sourceEmbedding,
+            userId,
+          );
+          const destinationNodeSearchResult = await this._searchDestinationNode(
+            destEmbedding,
+            userId,
+          );
 
-        let cypher: string;
-        let params: Record<string, any>;
+          let cypher: string;
+          let params: Record<string, any>;
 
-        if (
-          destinationNodeSearchResult.length === 0 &&
-          sourceNodeSearchResult.length > 0
-        ) {
-          cypher = `
+          if (
+            destinationNodeSearchResult.length === 0 &&
+            sourceNodeSearchResult.length > 0
+          ) {
+            cypher = `
             MATCH (source)
             WHERE elementId(source) = $source_id
             MERGE (destination:${destinationType} {name: $destination_name, user_id: $user_id})
@@ -490,17 +506,17 @@ export class MemoryGraph {
             RETURN source.name AS source, type(r) AS relationship, destination.name AS target
           `;
 
-          params = {
-            source_id: sourceNodeSearchResult[0].elementId,
-            destination_name: destination,
-            destination_embedding: destEmbedding,
-            user_id: userId,
-          };
-        } else if (
-          destinationNodeSearchResult.length > 0 &&
-          sourceNodeSearchResult.length === 0
-        ) {
-          cypher = `
+            params = {
+              source_id: sourceNodeSearchResult[0].elementId,
+              destination_name: destination,
+              destination_embedding: destEmbedding,
+              user_id: userId,
+            };
+          } else if (
+            destinationNodeSearchResult.length > 0 &&
+            sourceNodeSearchResult.length === 0
+          ) {
+            cypher = `
             MATCH (destination)
             WHERE elementId(destination) = $destination_id
             MERGE (source:${sourceType} {name: $source_name, user_id: $user_id})
@@ -513,17 +529,17 @@ export class MemoryGraph {
             RETURN source.name AS source, type(r) AS relationship, destination.name AS target
           `;
 
-          params = {
-            destination_id: destinationNodeSearchResult[0].elementId,
-            source_name: source,
-            source_embedding: sourceEmbedding,
-            user_id: userId,
-          };
-        } else if (
-          sourceNodeSearchResult.length > 0 &&
-          destinationNodeSearchResult.length > 0
-        ) {
-          cypher = `
+            params = {
+              destination_id: destinationNodeSearchResult[0].elementId,
+              source_name: source,
+              source_embedding: sourceEmbedding,
+              user_id: userId,
+            };
+          } else if (
+            sourceNodeSearchResult.length > 0 &&
+            destinationNodeSearchResult.length > 0
+          ) {
+            cypher = `
             MATCH (source)
             WHERE elementId(source) = $source_id
             MATCH (destination)
@@ -535,13 +551,13 @@ export class MemoryGraph {
             RETURN source.name AS source, type(r) AS relationship, destination.name AS target
           `;
 
-          params = {
-            source_id: sourceNodeSearchResult[0]?.elementId,
-            destination_id: destinationNodeSearchResult[0]?.elementId,
-            user_id: userId,
-          };
-        } else {
-          cypher = `
+            params = {
+              source_id: sourceNodeSearchResult[0]?.elementId,
+              destination_id: destinationNodeSearchResult[0]?.elementId,
+              user_id: userId,
+            };
+          } else {
+            cypher = `
             MERGE (n:${sourceType} {name: $source_name, user_id: $user_id})
             ON CREATE SET n.created = timestamp(), n.embedding = $source_embedding
             ON MATCH SET n.embedding = $source_embedding
@@ -553,17 +569,20 @@ export class MemoryGraph {
             RETURN n.name AS source, type(rel) AS relationship, m.name AS target
           `;
 
-          params = {
-            source_name: source,
-            dest_name: destination,
-            source_embedding: sourceEmbedding,
-            dest_embedding: destEmbedding,
-            user_id: userId,
-          };
-        }
+            params = {
+              source_name: source,
+              dest_name: destination,
+              source_embedding: sourceEmbedding,
+              dest_embedding: destEmbedding,
+              user_id: userId,
+            };
+          }
 
-        const result = await session.run(cypher, params);
-        results.push(result.records);
+          const result = await session.run(cypher, params);
+          results.push(result.records);
+        } catch (e) {
+          logger.error(`Error adding entity: ${e}`);
+        }
       }
     } finally {
       await session.close();
@@ -573,12 +592,26 @@ export class MemoryGraph {
   }
 
   private _removeSpacesFromEntities(entityList: any[]) {
-    return entityList.map((item) => ({
-      ...item,
-      source: item.source.toLowerCase().replace(/ /g, "_"),
-      relationship: item.relationship.toLowerCase().replace(/ /g, "_"),
-      destination: item.destination.toLowerCase().replace(/ /g, "_"),
-    }));
+    return entityList
+      .filter(
+        (item) =>
+          item &&
+          item.source != null &&
+          item.relationship != null &&
+          item.destination != null,
+      )
+      .map((item) => ({
+        ...item,
+        source: String(item.source)
+          .toLowerCase()
+          .replace(/[^a-zA-Z0-9_]/g, "_"),
+        relationship: String(item.relationship)
+          .toLowerCase()
+          .replace(/[^a-zA-Z0-9_]/g, "_"),
+        destination: String(item.destination)
+          .toLowerCase()
+          .replace(/[^a-zA-Z0-9_]/g, "_"),
+      }));
   }
 
   private async _searchSourceNode(

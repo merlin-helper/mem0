@@ -1,10 +1,23 @@
-import sqlite3 from "sqlite3";
+import type sqlite3Type from "sqlite3";
 import { HistoryManager } from "./base";
 
+/** See vector_stores/memory.ts for full rationale on lazy-loading sqlite3. */
+function loadSqlite3(): typeof sqlite3Type {
+  if (typeof require === "function") {
+    try { return require("sqlite3"); } catch {}
+  }
+  try {
+    const { createRequire } = require("module");
+    return createRequire(__filename)("sqlite3");
+  } catch {}
+  throw new Error("Failed to load sqlite3: neither require() nor createRequire() available");
+}
+
 export class SQLiteManager implements HistoryManager {
-  private db: sqlite3.Database;
+  private db: sqlite3Type.Database;
 
   constructor(dbPath: string) {
+    const sqlite3 = loadSqlite3();
     this.db = new sqlite3.Database(dbPath);
     this.init().catch(console.error);
   }
